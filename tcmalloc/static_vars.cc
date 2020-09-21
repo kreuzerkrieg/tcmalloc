@@ -18,6 +18,9 @@
 
 #include <atomic>
 #include <new>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "absl/base/attributes.h"
 #include "absl/base/const_init.h"
@@ -32,6 +35,47 @@
 #include "tcmalloc/thread_cache.h"
 #include "tcmalloc/tracking.h"
 
+static std::tuple<uint8_t*, size_t> getHugeMem()
+{
+    size_t total_hugepages = 0;
+    size_t free_hugepages = 0;
+    {
+        char buf[512] = {'\0'};
+        auto fd = open("/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages", O_RDONLY);
+        auto len = read(fd, buf, 512);
+        close(fd);
+        total_hugepages = std::atoi(buf);
+        if (total_hugepages == 0)
+        {
+            ::tcmalloc::Crash(::tcmalloc::kCrash, __FILE__, __LINE__, "No 1GiB hugepages are available");
+        }
+    }
+    {
+        char buf[512] = {'\0'};
+        auto fd = open("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages", O_RDONLY);
+        auto len = read(fd, buf, 512);
+        close(fd);
+        free_hugepages = std::atoi(buf);
+        if (free_hugepages == 0)
+        {
+            ::tcmalloc::Crash(::tcmalloc::kCrash, __FILE__, __LINE__, "No free 1GiB hugepages are available");
+        }
+    }
+
+    uint8_t *const base_address =
+        reinterpret_cast<uint8_t *>(0x40000000000ULL);
+    size_t size = free_hugepages * 1024 * 1024 * 1024;
+
+    int flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED | MAP_HUGETLB;
+    void *arena =
+        mmap(base_address, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (arena == base_address) {
+        return {reinterpret_cast<uint8_t*>(arena),size};
+    } else {
+        // TODO: Add some human readable message why mmap failed
+        ::tcmalloc::Crash(::tcmalloc::kCrash, __FILE__, __LINE__, "Failed to `mmap` hugepages", size);
+    }
+}
 namespace tcmalloc {
 
 // Cacheline-align our SizeMap and CPUCache.  They both have very hot arrays as
@@ -90,6 +134,10 @@ ABSL_ATTRIBUTE_COLD ABSL_ATTRIBUTE_NOINLINE void Static::SlowInitIfNecessary() {
 
   // double-checked locking
   if (!inited_.load(std::memory_order_acquire)) {
+    auto&& [huge_address, huge_size] = getHugeMem();
+    current_ptr_ = base_ptr_ = huge_address;
+    hugemem_size_ = huge_size;
+
     tracking::Init();
     sizemap_.Init();
     span_allocator_.Init(&arena_);
