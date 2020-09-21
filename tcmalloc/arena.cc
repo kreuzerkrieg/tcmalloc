@@ -24,7 +24,7 @@ void* Arena::Alloc(size_t bytes) {
     if (free_area_ == nullptr) {
         uint8_t *const base_address =
             reinterpret_cast<uint8_t *>(0x100000000000ULL);
-        size_t size = 1'000'000'000;
+        size_t size = 220'000'000'000;
 
         int flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED | MAP_HUGETLB;
         void *arena =
