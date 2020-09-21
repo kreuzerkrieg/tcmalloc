@@ -16,25 +16,37 @@
 
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/system-alloc.h"
+#include <sys/mman.h>
 
 namespace tcmalloc {
 
 void* Arena::Alloc(size_t bytes) {
+    if (free_area_ == nullptr) {
+        uint8_t *const base_address =
+            reinterpret_cast<uint8_t *>(0x100000000000ULL);
+        size_t size = 1'000'000'000;
+
+        int flags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED | MAP_HUGETLB;
+        void *arena =
+            mmap(base_address, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (arena == base_address) {
+            free_area_ = reinterpret_cast<char *>(arena);
+            free_avail_ = size;
+        } else {
+            std::string err_msg =
+                "FATAL ERROR: Failed to open huge page memory. Reason: ";
+            err_msg += std::strerror(errno);
+            Crash(kCrash, __FILE__, __LINE__, err_msg.c_str(), kAllocIncrement, size,
+                  arena);
+        }
+    }
   char* result;
   bytes = ((bytes + kAlignment - 1) / kAlignment) * kAlignment;
   if (free_avail_ < bytes) {
-    size_t ask = bytes > kAllocIncrement ? bytes : kAllocIncrement;
-    size_t actual_size;
-    free_area_ = reinterpret_cast<char*>(
-        SystemAlloc(ask, &actual_size, kPageSize, /*tagged=*/false));
-    if (ABSL_PREDICT_FALSE(free_area_ == nullptr)) {
       Crash(kCrash, __FILE__, __LINE__,
             "FATAL ERROR: Out of memory trying to allocate internal tcmalloc "
             "data (bytes, object-size)",
             kAllocIncrement, bytes);
-    }
-    SystemBack(free_area_, actual_size);
-    free_avail_ = actual_size;
   }
 
   ASSERT(reinterpret_cast<uintptr_t>(free_area_) % kAlignment == 0);
