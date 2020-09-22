@@ -41,6 +41,7 @@ void* Arena::Alloc(size_t bytes) {
         }
     }
 
+
   char* result;
   bytes = ((bytes + kAlignment - 1) / kAlignment) * kAlignment;
   if (free_avail_ < bytes) {
