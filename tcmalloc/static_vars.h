@@ -126,7 +126,11 @@ class Static {
   // structure, so figure out how much of it is actually resident.
   static size_t pagemap_residence();
 
- private:
+  static inline uint8_t* base_ptr_ = nullptr;
+  static inline uint8_t* current_ptr_ = nullptr;
+  static inline size_t hugemem_size_ = 0;
+
+private:
 #if defined(__clang__)
   __attribute__((preserve_most))
 #endif

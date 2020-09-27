@@ -173,12 +173,12 @@ std::pair<void*, size_t> MmapRegion::Alloc(size_t request_size,
 
   ASSERT(result % pagesize == 0);
   void* result_ptr = reinterpret_cast<void*>(result);
-  if (mprotect(result_ptr, actual_size, PROT_READ | PROT_WRITE) != 0) {
-    Log(kLogWithStack, __FILE__, __LINE__,
-        "mprotect() region failed (ptr, size, error)", result_ptr, actual_size,
-        strerror(errno));
-    return {nullptr, 0};
-  }
+//  if (mprotect(result_ptr, actual_size, PROT_READ | PROT_WRITE) != 0) {
+//    Log(kLogWithStack, __FILE__, __LINE__,
+//        "mprotect() region failed (ptr, size, error)", result_ptr, actual_size,
+//        strerror(errno));
+//    return {nullptr, 0};
+//  }
   free_size_ -= actual_size;
   return {result_ptr, actual_size};
 }
@@ -286,7 +286,33 @@ ABSL_CONST_INIT std::atomic<int> system_release_errors = ATOMIC_VAR_INIT(0);
 
 }  // namespace
 
-void* SystemAlloc(size_t bytes, size_t* actual_bytes, size_t alignment,
+static uintptr_t AddressHint(uintptr_t base_addr, size_t size, size_t alignment, bool tagged) {
+    // Mask out bits that cannot be used by the hardware, mask out the top
+    // "usable" bit since it is reserved for kernel use, and also mask out the
+    // next top bit to significantly reduce collisions with mappings that tend to
+    // be placed in the upper half of the address space (e.g., stack, executable,
+    // kernel-placed mmaps).  See b/139357826.
+#if defined(MEMORY_SANITIZER) || defined(THREAD_SANITIZER)
+    // MSan and TSan use up all of the lower address space, so we allow use of
+  // mid-upper address space when they're active.  This only matters for
+  // TCMalloc-internal tests, since sanitizers install their own malloc/free.
+  constexpr uintptr_t kAddrMask = (uintptr_t{3} << (kAddressBits - 3)) - 1;
+#else
+    constexpr uintptr_t kAddrMask = (uintptr_t{1} << (kAddressBits - 2)) - 1;
+#endif
+
+    // Ensure alignment >= size so we're guaranteed the full mapping has the same
+    // tag.
+    alignment = RoundUpPowerOf2(std::max(alignment, size));
+
+    uintptr_t addr = base_addr & kAddrMask & ~(alignment - 1) & ~kTagMask;
+    if (!tagged) {
+        addr |= kTagMask;
+    }
+    return addr;
+}
+
+void* SystemAllocAlt(size_t bytes, size_t* actual_bytes, size_t alignment,
                   bool tagged) {
   // If default alignment is set request the minimum alignment provided by
   // the system.
@@ -303,46 +329,52 @@ void* SystemAlloc(size_t bytes, size_t* actual_bytes, size_t alignment,
 
   InitSystemAllocatorIfNecessary();
 
-  void* result = nullptr;
-  std::tie(result, *actual_bytes) =
-      region_manager->Alloc(bytes, alignment, tagged);
-
-  if (result != nullptr) {
-    CheckAddressBits<kAddressBits>(reinterpret_cast<uintptr_t>(result) +
-                                   *actual_bytes - 1);
-    ASSERT(tcmalloc::IsTaggedMemory(result) == tagged);
+  uint8_t* result = Static::current_ptr_;
+  result = reinterpret_cast<uint8_t *>(AddressHint(reinterpret_cast<uintptr_t>(result), bytes, alignment, tagged));
+  if (result + bytes > Static::base_ptr_ + Static::hugemem_size_)
+  {
+    Crash(kCrash, __FILE__, __LINE__, "No more hugepages memory left");
   }
+
+  *actual_bytes = bytes;
+  Static::current_ptr_ = result + bytes;
+
+  CheckAddressBits<kAddressBits>(reinterpret_cast<uintptr_t>(result) +
+                                   *actual_bytes - 1);
+  ASSERT(tcmalloc::IsTaggedMemory(result) == tagged);
   return result;
 }
 
+void* SystemAlloc(size_t bytes, size_t* actual_bytes, size_t alignment,
+                  bool tagged) {
+    // If default alignment is set request the minimum alignment provided by
+    // the system.
+    alignment = std::max(alignment, pagesize);
+
+    // Discard requests that overflow
+    if (bytes + alignment < bytes) return nullptr;
+
+    // This may return significantly more memory than "bytes" by default, so
+    // require callers to know the true amount allocated.
+    ASSERT(actual_bytes != nullptr);
+
+    absl::base_internal::SpinLockHolder lock_holder(&spinlock);
+
+    InitSystemAllocatorIfNecessary();
+
+    void* result = nullptr;
+    std::tie(result, *actual_bytes) =
+        region_manager->Alloc(bytes, alignment, tagged);
+
+    if (result != nullptr) {
+        CheckAddressBits<kAddressBits>(reinterpret_cast<uintptr_t>(result) +
+                                       *actual_bytes - 1);
+        ASSERT(tcmalloc::IsTaggedMemory(result) == tagged);
+    }
+    return result;
+}
+
 static bool ReleasePages(void* start, size_t length) {
-  int ret;
-  // Note -- ignoring most return codes, because if this fails it
-  // doesn't matter...
-  // Moreover, MADV_REMOVE *will* fail (with EINVAL) on anonymous memory,
-  // but that's harmless.
-#ifdef MADV_REMOVE
-  // MADV_REMOVE deletes any backing storage for non-anonymous memory
-  // (tmpfs).
-  do {
-    ret = madvise(start, length, MADV_REMOVE);
-  } while (ret == -1 && errno == EAGAIN);
-
-  if (ret == 0) {
-    return true;
-  }
-#endif
-#ifdef MADV_DONTNEED
-  // MADV_DONTNEED drops page table info and any anonymous pages.
-  do {
-    ret = madvise(start, length, MADV_DONTNEED);
-  } while (ret == -1 && errno == EAGAIN);
-
-  if (ret == 0) {
-    return true;
-  }
-#endif
-
   return false;
 }
 
@@ -351,6 +383,7 @@ int SystemReleaseErrors() {
 }
 
 void SystemRelease(void* start, size_t length) {
+    return;
   int saved_errno = errno;
 #if defined(MADV_DONTNEED) || defined(MADV_REMOVE)
   const size_t pagemask = pagesize - 1;
@@ -472,7 +505,37 @@ static uintptr_t RandomMmapHint(size_t size, size_t alignment, bool tagged) {
   return addr;
 }
 
-void* MmapAligned(size_t size, size_t alignment, bool tagged) {
+void * MmapAligned(size_t size, size_t alignment, bool tagged)
+{
+    ASSERT(size <= kTagMask);
+    ASSERT(alignment <= kTagMask);
+
+    static uintptr_t next_untagged_addr = 0;
+    static uintptr_t next_tagged_addr = 0;
+
+    uintptr_t & next_addr = tagged ? next_tagged_addr : next_untagged_addr;
+
+    uint8_t * current_ptr = Static::current_ptr_;
+
+    if (!next_addr || next_addr & (alignment - 1) || IsTaggedMemory(reinterpret_cast<void *>(next_addr)) != tagged
+        || IsTaggedMemory(reinterpret_cast<void *>(next_addr + size - 1)) != tagged)
+    {
+        next_addr = AddressHint(reinterpret_cast<uintptr_t>(current_ptr), size, alignment, tagged);
+    }
+
+    if (reinterpret_cast<uint8_t *>(next_addr) + size > Static::base_ptr_ + Static::hugemem_size_)
+    {
+        Crash(kCrash, __FILE__, __LINE__, "No more hugepages memory left");
+    }
+
+    void * hint = reinterpret_cast<void *>(next_addr);
+    Static::current_ptr_ = reinterpret_cast<uint8_t *>(next_addr + size);
+
+    CHECK_CONDITION(kAddressBits == std::numeric_limits<uintptr_t>::digits || next_addr <= uintptr_t{1} << kAddressBits);
+    return hint;
+}
+
+void* MmapAlignedOrig(size_t size, size_t alignment, bool tagged) {
   ASSERT(size <= kTagMask);
   ASSERT(alignment <= kTagMask);
 
